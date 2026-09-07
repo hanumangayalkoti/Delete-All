@@ -365,18 +365,24 @@ async def is_chat_admin(
 
 
 def is_missing(exc: TelegramError) -> bool:
-    """True when Telegram is telling us the message simply isn't there."""
+    """
+    True only when Telegram says the message isn't there at all.
+
+    Anything else - including "message can't be deleted" - is a real refusal
+    and gets recorded so we can see why.
+    """
     text = str(exc).lower()
     return (
-        "not found" in text
-        or "message to delete" in text
+        "message to delete not found" in text
         or "message identifier is not specified" in text
-        or "message can't be deleted" in text
     )
 
 
 async def delete_ids(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, ids: list[int]
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    ids: list[int],
+    report: dict,
 ) -> int:
     """
     Delete these message IDs and return how many were actually removed.
@@ -417,14 +423,20 @@ async def delete_ids(
             except Forbidden:
                 raise
             except TelegramError as exc:
-                if not is_missing(exc):
-                    logger.debug("Could not delete %s in %s: %s", ids[0], chat_id, exc)
+                if is_missing(exc):
+                    report["missing"] = report.get("missing", 0) + 1
+                else:
+                    report["refused"] = report.get("refused", 0) + 1
+                    reasons = report.setdefault("reasons", {})
+                    key = str(exc)[:120]
+                    reasons[key] = reasons.get(key, 0) + 1
+                    logger.info("Refused to delete %s in %s: %s", ids[0], chat_id, exc)
                 return 0
         return 0
 
     mid = len(ids) // 2
-    left = await delete_ids(context, chat_id, ids[:mid])
-    right = await delete_ids(context, chat_id, ids[mid:])
+    left = await delete_ids(context, chat_id, ids[:mid], report)
+    right = await delete_ids(context, chat_id, ids[mid:], report)
     return left + right
 
 
@@ -443,6 +455,7 @@ async def run_delete_job(
     started_at = now_str()
     deleted = 0
     job_status = "Completed"
+    report: dict = {}
 
     # Capture details now — they're unavailable once the bot leaves.
     chat_info = await chat_block(context, chat_id, chat_title, chat_type)
@@ -473,7 +486,7 @@ async def run_delete_job(
                 current -= 1
 
             try:
-                deleted += await delete_ids(context, chat_id, ids)
+                deleted += await delete_ids(context, chat_id, ids, report)
             except Forbidden:
                 job_status = "Stopped — bot lost access"
                 logger.warning("Lost access to chat %s", chat_id)
@@ -500,7 +513,7 @@ async def run_delete_job(
                     if i != status_message_id
                 ]
                 for i in range(0, len(tail), BATCH_SIZE):
-                    deleted += await delete_ids(context, chat_id, tail[i : i + BATCH_SIZE])
+                    deleted += await delete_ids(context, chat_id, tail[i : i + BATCH_SIZE], report)
                 try:
                     await context.bot.delete_message(chat_id, probe.message_id)
                 except TelegramError:
@@ -509,10 +522,18 @@ async def run_delete_job(
                 pass
 
         if job_status == "Completed":
-            await set_status(
-                f"✅ <b>All messages deleted</b>\n\n"
-                f"I'm leaving this {word} now. See you again 🙏"
-            )
+            if report.get("refused"):
+                await set_status(
+                    f"✅ <b>Cleanup finished</b>\n\n"
+                    f"Telegram wouldn't let me remove <b>{report['refused']}</b> "
+                    f"older messages, so those are still here.\n\n"
+                    f"I'm leaving this {word} now. See you again 🙏"
+                )
+            else:
+                await set_status(
+                    f"✅ <b>All messages deleted</b>\n\n"
+                    f"I'm leaving this {word} now. See you again 🙏"
+                )
             await asyncio.sleep(3)
 
             try:
@@ -535,6 +556,18 @@ async def run_delete_job(
 
         record_job(chat_id, chat_title, chat_type, who_short(actor), deleted, job_status)
 
+        refused = report.get("refused", 0)
+        if refused:
+            reasons = sorted(
+                report.get("reasons", {}).items(), key=lambda kv: kv[1], reverse=True
+            )[:3]
+            detail = "\n".join(f"   – {esc(msg)} (x{count})" for msg, count in reasons)
+            diagnostics = (
+                f"• Telegram refused: <b>{refused}</b> messages\n{detail}\n"
+            )
+        else:
+            diagnostics = ""
+
         await notify_owner(
             context,
             "🧹 <b>Delete job</b>\n\n"
@@ -544,7 +577,8 @@ async def run_delete_job(
             f"• Started: {started_at}\n"
             f"• Finished: {now_str()}\n"
             f"• Message IDs scanned: <b>{deleted:,}</b>\n"
-            f"• Status: {esc(job_status)}\n\n"
+            f"• Status: {esc(job_status)}\n"
+            f"{diagnostics}\n"
             f"Total jobs so far: <b>{STATS.get('jobs', 0)}</b>",
         )
 
