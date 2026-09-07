@@ -116,20 +116,29 @@ def progress_bar(pct: int, frame: int) -> str:
 
 
 def admin_rights() -> ChatAdministratorRights:
-    """Permissions requested when a user picks a chat from the list."""
+    """
+    Permissions requested when a user picks a chat from the list.
+
+    Everything except promoting other admins. can_post_messages and
+    can_edit_messages matter here: Telegram ties deletion of a channel's own
+    posts to those rights, not just can_delete_messages.
+    """
     return ChatAdministratorRights(
         is_anonymous=False,
         can_manage_chat=True,
         can_delete_messages=True,
-        can_manage_video_chats=False,
-        can_restrict_members=False,
-        can_promote_members=False,
-        can_change_info=False,
-        can_invite_users=False,
-        can_post_stories=False,
-        can_edit_stories=False,
-        can_delete_stories=False,
+        can_manage_video_chats=True,
+        can_restrict_members=True,
+        can_promote_members=False,   # never ask to add other admins
+        can_change_info=True,
+        can_invite_users=True,
+        can_post_stories=True,
+        can_edit_stories=True,
+        can_delete_stories=True,
         can_post_messages=True,
+        can_edit_messages=True,
+        can_pin_messages=True,
+        can_manage_topics=True,
     )
 
 
@@ -321,6 +330,26 @@ async def chat_block(
 # --------------------------------------------------------------------------
 
 
+async def my_rights(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
+    """List the rights the bot actually holds, for the owner report."""
+    try:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+    except TelegramError as exc:
+        return f"could not read ({esc(exc)})"
+
+    names = [
+        "can_delete_messages",
+        "can_post_messages",
+        "can_edit_messages",
+        "can_manage_chat",
+        "can_restrict_members",
+        "can_change_info",
+        "can_pin_messages",
+    ]
+    held = [n.replace("can_", "") for n in names if getattr(me, n, False)]
+    return ", ".join(held) if held else "none"
+
+
 async def bot_can_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> tuple[bool, str]:
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
@@ -459,6 +488,7 @@ async def run_delete_job(
 
     # Capture details now — they're unavailable once the bot leaves.
     chat_info = await chat_block(context, chat_id, chat_title, chat_type)
+    rights = await my_rights(context, chat_id)
 
     async def set_status(text: str) -> None:
         try:
@@ -564,6 +594,7 @@ async def run_delete_job(
             detail = "\n".join(f"   – {esc(msg)} (x{count})" for msg, count in reasons)
             diagnostics = (
                 f"• Telegram refused: <b>{refused}</b> messages\n{detail}\n"
+                f"• My rights there: {esc(rights)}\n"
             )
         else:
             diagnostics = ""
