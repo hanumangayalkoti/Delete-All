@@ -1,19 +1,20 @@
 """
 DelAll Bot
 ----------
-A Telegram bot that deletes all messages in a channel or group, then removes
-itself from that channel or group automatically.
+A Telegram bot that deletes every message in a channel or group, then leaves
+it automatically.
 
-Two ways to use it:
-  1. Tap "Add Channel" / "Add Group" in the bot's private chat. Telegram shows
-     your list, and the bot is added as an admin automatically.
-  2. Add the bot as an admin manually and send /delall inside the channel/group.
+How people use it:
+  1. Tap "Add Channel" or "Add Group" in the bot's private chat. Telegram shows
+     their own list, and the bot is promoted to admin automatically.
+  2. Open that channel or group and send /delall there.
+  3. Tap Confirm Delete.
 
 Owner notifications (ADMIN_IDS):
-  - Someone starts the bot        -> full user details
-  - The bot is added to a chat    -> full channel/group details
-  - A delete job runs             -> full job report
-  - /stats                        -> overall usage
+  - Someone starts the bot     -> full user details
+  - The bot is added to a chat -> full channel/group details
+  - A delete job runs          -> full report
+  - /stats                     -> overall usage
 """
 
 import asyncio
@@ -32,7 +33,6 @@ from telegram import (
     KeyboardButton,
     KeyboardButtonRequestChat,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ChatType, ParseMode
@@ -75,14 +75,15 @@ TZ_OFFSET_HOURS = float(os.environ.get("TZ_OFFSET_HOURS", "5.5"))
 TZ_NAME = os.environ.get("TZ_NAME", "IST")
 
 BATCH_SIZE = 100          # Telegram's bulk delete limit
-BATCH_DELAY = 0.5         # pause between batches
-PROGRESS_EVERY = 8        # update the progress message every N batches
-RETRY_SWEEPS = 3          # extra passes over messages that failed the first time
-MAX_FLOOD_RETRIES = 25    # how many times to wait out Telegram rate limits
+BATCH_DELAY = 0.4         # pause between batches
+PROGRESS_EVERY = 5        # refresh the progress message every N batches
+MAX_FLOOD_RETRIES = 25    # how many times to wait out a rate limit
 
-# Request IDs for the chat picker buttons
 REQ_CHANNEL = 1
 REQ_GROUP = 2
+
+SPINNER = ["⏳", "⌛"]
+BAR_SLOTS = 12
 
 RUNNING: set[int] = set()
 
@@ -103,8 +104,19 @@ def esc(text) -> str:
     return html.escape(str(text)) if text is not None else ""
 
 
+def chat_type_word(chat_type: str) -> str:
+    return "channel" if chat_type == "channel" else "group"
+
+
+def progress_bar(pct: int, frame: int) -> str:
+    pct = max(0, min(100, pct))
+    filled = round(BAR_SLOTS * pct / 100)
+    bar = "▰" * filled + "▱" * (BAR_SLOTS - filled)
+    return f"{SPINNER[frame % len(SPINNER)]} <code>{bar}</code> {pct}%"
+
+
 def admin_rights() -> ChatAdministratorRights:
-    """The permissions the bot asks for when a user picks a chat."""
+    """Permissions requested when a user picks a chat from the list."""
     return ChatAdministratorRights(
         is_anonymous=False,
         can_manage_chat=True,
@@ -123,35 +135,23 @@ def admin_rights() -> ChatAdministratorRights:
 
 def picker_keyboard() -> ReplyKeyboardMarkup:
     """Buttons that open Telegram's own channel/group picker."""
+
+    def button(label: str, req_id: int, is_channel: bool) -> KeyboardButton:
+        return KeyboardButton(
+            label,
+            request_chat=KeyboardButtonRequestChat(
+                request_id=req_id,
+                chat_is_channel=is_channel,
+                bot_is_member=False,
+                bot_administrator_rights=admin_rights(),
+                user_administrator_rights=admin_rights(),
+                request_title=True,
+                request_username=True,
+            ),
+        )
+
     return ReplyKeyboardMarkup(
-        [
-            [
-                KeyboardButton(
-                    "➕ Add Channel",
-                    request_chat=KeyboardButtonRequestChat(
-                        request_id=REQ_CHANNEL,
-                        chat_is_channel=True,
-                        bot_is_member=False,
-                        bot_administrator_rights=admin_rights(),
-                        user_administrator_rights=admin_rights(),
-                        request_title=True,
-                        request_username=True,
-                    ),
-                ),
-                KeyboardButton(
-                    "➕ Add Group",
-                    request_chat=KeyboardButtonRequestChat(
-                        request_id=REQ_GROUP,
-                        chat_is_channel=False,
-                        bot_is_member=False,
-                        bot_administrator_rights=admin_rights(),
-                        user_administrator_rights=admin_rights(),
-                        request_title=True,
-                        request_username=True,
-                    ),
-                ),
-            ]
-        ],
+        [[button("➕ Add Channel", REQ_CHANNEL, True), button("➕ Add Group", REQ_GROUP, False)]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -186,7 +186,7 @@ STATS = load_stats()
 
 
 def record_user(user) -> bool:
-    """Store the user. Returns True if this is a first-time user."""
+    """Store the user. Returns True for a first-time user."""
     users = STATS.setdefault("users", {})
     key = str(user.id)
     is_new = key not in users
@@ -209,7 +209,7 @@ def record_user(user) -> bool:
     return is_new
 
 
-def record_job(chat_id, title, chat_type, who, deleted, failed, status) -> None:
+def record_job(chat_id, title, chat_type, who, deleted, status) -> None:
     STATS["jobs"] = STATS.get("jobs", 0) + 1
     STATS["deleted"] = STATS.get("deleted", 0) + deleted
 
@@ -227,7 +227,6 @@ def record_job(chat_id, title, chat_type, who, deleted, failed, status) -> None:
             "type": chat_type,
             "who": who,
             "deleted": deleted,
-            "failed": failed,
             "status": status,
         },
     )
@@ -275,25 +274,27 @@ def who_short(user) -> str:
     return f"{name} ({user.id})"
 
 
-async def chat_block(context: ContextTypes.DEFAULT_TYPE, chat_id: int, fallback_title=None) -> str:
+async def chat_block(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, fallback_title=None, fallback_type=None
+) -> str:
     """Collect as much detail about a channel/group as the API allows."""
-    lines = []
     try:
         chat = await context.bot.get_chat(chat_id)
     except TelegramError:
+        word = chat_type_word(fallback_type or "channel").capitalize()
         return (
-            f"• Title: <b>{esc(fallback_title or chat_id)}</b>\n"
-            f"• Chat ID: <code>{chat_id}</code>"
+            f"• {word}: <b>{esc(fallback_title or chat_id)}</b>\n"
+            f"• {word} ID: <code>{chat_id}</code>"
         )
 
-    lines.append(f"• Title: <b>{esc(chat.title or fallback_title or chat_id)}</b>")
-    lines.append(f"• Type: {esc(chat.type)}")
-    lines.append(f"• Chat ID: <code>{chat_id}</code>")
+    ctype = chat.type or fallback_type or "channel"
+    word = chat_type_word(ctype).capitalize()
 
-    if getattr(chat, "username", None):
-        lines.append(f"• Link: @{esc(chat.username)} — https://t.me/{esc(chat.username)}")
-    else:
-        lines.append("• Link: <i>private — no public username</i>")
+    lines = [
+        f"• {word}: <b>{esc(chat.title or fallback_title or chat_id)}</b>",
+        f"• {word} ID: <code>{chat_id}</code>",
+        f"• Type: {esc(ctype)}",
+    ]
 
     try:
         count = await context.bot.get_chat_member_count(chat_id)
@@ -303,8 +304,14 @@ async def chat_block(context: ContextTypes.DEFAULT_TYPE, chat_id: int, fallback_
 
     if getattr(chat, "description", None):
         lines.append(f"• Description: {esc(chat.description[:150])}")
-    if getattr(chat, "invite_link", None):
-        lines.append(f"• Invite link: {esc(chat.invite_link)}")
+
+    # Link last
+    if getattr(chat, "username", None):
+        lines.append(f"• Link: https://t.me/{esc(chat.username)} (@{esc(chat.username)})")
+    elif getattr(chat, "invite_link", None):
+        lines.append(f"• Link: {esc(chat.invite_link)}")
+    else:
+        lines.append("• Link: <i>private — no public link</i>")
 
     return "\n".join(lines)
 
@@ -327,14 +334,14 @@ async def bot_can_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> tu
         return False, (
             "I'm not an administrator there yet.\n\n"
             "Open the channel or group → <b>Administrators</b> → <b>Add Admin</b> → "
-            "select me, and turn on <b>Delete Messages</b>. Then send /delall again."
+            "select me, and turn on <b>Delete Messages</b>. Then send /delall there."
         )
 
     if not getattr(me, "can_delete_messages", False):
         return False, (
             "I'm an administrator, but the <b>Delete Messages</b> permission is off.\n\n"
             "Open the channel or group → <b>Administrators</b> → select me → "
-            "turn on <b>Delete Messages</b>. Then send /delall again."
+            "turn on <b>Delete Messages</b>. Then send /delall there."
         )
 
     return True, ""
@@ -357,75 +364,93 @@ async def is_chat_admin(
 # --------------------------------------------------------------------------
 
 
+def is_missing(exc: TelegramError) -> bool:
+    """True when Telegram is telling us the message simply isn't there."""
+    text = str(exc).lower()
+    return (
+        "not found" in text
+        or "message to delete" in text
+        or "message identifier is not specified" in text
+        or "message can't be deleted" in text
+    )
+
+
 async def delete_ids(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, ids: list[int]
-) -> tuple[int, list[int]]:
-    """Delete a batch. Returns (deleted_count, ids_that_failed)."""
+) -> int:
+    """
+    Delete these message IDs and return how many were actually removed.
+
+    Bulk delete is tried first. If Telegram rejects the batch, we split it in
+    half and retry each half, so a few gaps or undeletable messages never cost
+    us the whole batch. IDs that don't exist are skipped silently.
+    """
     if not ids:
-        return 0, []
+        return 0
 
     for _ in range(MAX_FLOOD_RETRIES):
         try:
             await context.bot.delete_messages(chat_id=chat_id, message_ids=ids)
-            return len(ids), []
+            return len(ids)
         except RetryAfter as exc:
-            # Rate limited — wait it out and try the same batch again.
             await asyncio.sleep(float(exc.retry_after) + 1)
+            continue
         except Forbidden:
             raise
         except BadRequest:
-            # The bulk call was rejected. Fall back to one message at a time so
-            # a single undeletable message doesn't cost us the whole batch.
-            deleted = 0
-            failed: list[int] = []
-            for mid in ids:
-                for _ in range(MAX_FLOOD_RETRIES):
-                    try:
-                        await context.bot.delete_message(chat_id=chat_id, message_id=mid)
-                        deleted += 1
-                        break
-                    except RetryAfter as exc:
-                        await asyncio.sleep(float(exc.retry_after) + 1)
-                    except Forbidden:
-                        raise
-                    except TelegramError:
-                        failed.append(mid)
-                        break
-            return deleted, failed
+            break
         except TelegramError as exc:
             logger.warning("Batch error in chat %s: %s", chat_id, exc)
             await asyncio.sleep(2)
+            continue
+    else:
+        return 0
 
-    return 0, list(ids)
+    # The batch was rejected — narrow it down.
+    if len(ids) == 1:
+        for _ in range(MAX_FLOOD_RETRIES):
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=ids[0])
+                return 1
+            except RetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 1)
+            except Forbidden:
+                raise
+            except TelegramError as exc:
+                if not is_missing(exc):
+                    logger.debug("Could not delete %s in %s: %s", ids[0], chat_id, exc)
+                return 0
+        return 0
+
+    mid = len(ids) // 2
+    left = await delete_ids(context, chat_id, ids[:mid])
+    right = await delete_ids(context, chat_id, ids[mid:])
+    return left + right
 
 
 async def run_delete_job(
     context: ContextTypes.DEFAULT_TYPE,
-    target_chat_id: int,
-    status_chat_id: int,
+    chat_id: int,
     status_message_id: int,
     actor,
     chat_title: str,
     chat_type: str,
 ) -> None:
-    """Delete everything in target_chat_id, then leave it."""
-    RUNNING.add(target_chat_id)
+    """Delete everything in the chat, keep the closing message, then leave."""
+    RUNNING.add(chat_id)
 
-    same_chat = status_chat_id == target_chat_id
-    protected = status_message_id if same_chat else None
-
+    word = chat_type_word(chat_type)
     started_at = now_str()
     deleted = 0
-    failed: list[int] = []
-    job_status = "completed"
+    job_status = "Completed"
 
-    # Capture the details now — they're unavailable once the bot leaves.
-    chat_info = await chat_block(context, target_chat_id, chat_title)
+    # Capture details now — they're unavailable once the bot leaves.
+    chat_info = await chat_block(context, chat_id, chat_title, chat_type)
 
     async def set_status(text: str) -> None:
         try:
             await context.bot.edit_message_text(
-                chat_id=status_chat_id,
+                chat_id=chat_id,
                 message_id=status_message_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
@@ -433,156 +458,95 @@ async def run_delete_job(
         except TelegramError:
             pass
 
-    await set_status("🧹 <b>Deleting messages…</b>")
+    await set_status(f"{progress_bar(0, 0)}\n\n🧹 <b>Deleting messages…</b>")
 
     try:
-        # Find the newest message ID in the target chat.
-        if same_chat:
-            highest = status_message_id
-        else:
-            probe = await context.bot.send_message(target_chat_id, "🧹 Starting cleanup…")
-            highest = probe.message_id
-
-        total = highest
-        current = highest
+        total = status_message_id
+        current = status_message_id
         batches = 0
 
         while current > 0:
             ids: list[int] = []
             while current > 0 and len(ids) < BATCH_SIZE:
-                if current != protected:
+                if current != status_message_id:  # keep the closing message
                     ids.append(current)
                 current -= 1
 
             try:
-                done, bad = await delete_ids(context, target_chat_id, ids)
+                deleted += await delete_ids(context, chat_id, ids)
             except Forbidden:
-                job_status = "stopped — bot lost access"
-                logger.warning("Lost access to chat %s", target_chat_id)
+                job_status = "Stopped — bot lost access"
+                logger.warning("Lost access to chat %s", chat_id)
                 break
 
-            deleted += done
-            failed.extend(bad)
             batches += 1
 
             if batches % PROGRESS_EVERY == 0:
                 pct = int(((total - current) / total) * 100) if total else 100
                 await set_status(
-                    f"🧹 <b>Deleting messages… {pct}%</b>\n\n"
-                    f"Deleted so far: <b>{deleted}</b>"
+                    f"{progress_bar(pct, batches)}\n\n🧹 <b>Deleting messages…</b>"
                 )
 
             await asyncio.sleep(BATCH_DELAY)
 
-        # Extra passes over anything that didn't go the first time.
-        if job_status == "completed" and failed:
-            for sweep in range(RETRY_SWEEPS):
-                if not failed:
-                    break
-                await set_status(
-                    f"🧹 <b>Finishing up…</b>\n\n"
-                    f"Deleted so far: <b>{deleted}</b>\n"
-                    f"Retrying <b>{len(failed)}</b> remaining messages"
-                )
-                retry_list, failed = failed, []
-                for i in range(0, len(retry_list), BATCH_SIZE):
-                    chunk = retry_list[i : i + BATCH_SIZE]
-                    try:
-                        done, bad = await delete_ids(context, target_chat_id, chunk)
-                    except Forbidden:
-                        job_status = "stopped — bot lost access"
-                        failed.extend(retry_list[i:])
-                        break
-                    deleted += done
-                    failed.extend(bad)
-                    await asyncio.sleep(BATCH_DELAY)
-                if job_status != "completed":
-                    break
-                await asyncio.sleep(2)
-
-        # Anything posted while we were working.
-        if job_status == "completed":
+        # Catch anything posted while we were working. The probe tells us the
+        # newest message ID; it is removed afterwards and never counted.
+        if job_status == "Completed":
             try:
-                marker = await context.bot.send_message(target_chat_id, "🧹")
-                if marker.message_id > highest + 1:
-                    tail = list(range(highest + 1, marker.message_id + 1))
-                    for i in range(0, len(tail), BATCH_SIZE):
-                        done, bad = await delete_ids(
-                            context, target_chat_id, tail[i : i + BATCH_SIZE]
-                        )
-                        deleted += done
-                        failed.extend(bad)
-                else:
-                    await context.bot.delete_message(target_chat_id, marker.message_id)
+                probe = await context.bot.send_message(chat_id, "🧹")
+                tail = [
+                    i
+                    for i in range(status_message_id + 1, probe.message_id)
+                    if i != status_message_id
+                ]
+                for i in range(0, len(tail), BATCH_SIZE):
+                    deleted += await delete_ids(context, chat_id, tail[i : i + BATCH_SIZE])
+                try:
+                    await context.bot.delete_message(chat_id, probe.message_id)
+                except TelegramError:
+                    pass
             except TelegramError:
                 pass
 
-        if job_status == "completed":
-            if failed:
-                summary = (
-                    "✅ <b>Done</b>\n\n"
-                    f"Deleted <b>{deleted}</b> messages.\n"
-                    f"<b>{len(failed)}</b> could not be deleted — Telegram doesn't "
-                    "allow bots to remove those.\n\n"
-                    f"Leaving the {chat_type_word(chat_type)} now."
-                )
-            else:
-                summary = (
-                    "✅ <b>Done</b>\n\n"
-                    f"Deleted <b>{deleted}</b> messages.\n\n"
-                    f"Leaving the {chat_type_word(chat_type)} now."
-                )
-            await set_status(summary)
-            await asyncio.sleep(4)
-
-            if same_chat:
-                try:
-                    await context.bot.delete_message(target_chat_id, status_message_id)
-                except TelegramError:
-                    pass
+        if job_status == "Completed":
+            await set_status(
+                f"✅ <b>All messages deleted</b>\n\n"
+                f"I'm leaving this {word} now. See you again 🙏"
+            )
+            await asyncio.sleep(3)
 
             try:
-                await context.bot.leave_chat(target_chat_id)
-                logger.info("Left chat %s after deleting %s messages", target_chat_id, deleted)
+                await context.bot.leave_chat(chat_id)
+                logger.info("Left chat %s after deleting %s messages", chat_id, deleted)
             except TelegramError as exc:
-                logger.warning("Could not leave chat %s: %s", target_chat_id, exc)
+                logger.warning("Could not leave chat %s: %s", chat_id, exc)
         else:
             await set_status(
-                f"⚠️ <b>Stopped early</b>\n\nDeleted <b>{deleted}</b> messages before "
-                "I lost access to that channel or group."
+                f"⚠️ <b>Stopped early</b>\n\n"
+                f"I lost access to this {word} before finishing."
             )
 
     except Exception:
-        job_status = "error"
-        logger.exception("Delete job failed for chat %s", target_chat_id)
-        await set_status(
-            f"⚠️ <b>Something went wrong</b>\n\nDeleted <b>{deleted}</b> messages "
-            "before the error."
-        )
+        job_status = "Error"
+        logger.exception("Delete job failed for chat %s", chat_id)
+        await set_status("⚠️ <b>Something went wrong.</b> The cleanup did not finish.")
     finally:
-        RUNNING.discard(target_chat_id)
+        RUNNING.discard(chat_id)
 
-        record_job(
-            target_chat_id, chat_title, chat_type, who_short(actor), deleted, len(failed), job_status
-        )
+        record_job(chat_id, chat_title, chat_type, who_short(actor), deleted, job_status)
 
         await notify_owner(
             context,
             "🧹 <b>Delete job</b>\n\n"
-            f"<b>Channel / group:</b>\n{chat_info}\n\n"
-            f"<b>Started by:</b>\n{user_block(actor)}\n\n"
-            "<b>Result:</b>\n"
+            f"{chat_info}\n\n"
+            f"<b>Started by</b>\n{user_block(actor)}\n\n"
+            f"<b>Result</b>\n"
             f"• Started: {started_at}\n"
             f"• Finished: {now_str()}\n"
-            f"• Deleted: <b>{deleted}</b>\n"
-            f"• Failed: <b>{len(failed)}</b>\n"
+            f"• Message IDs scanned: <b>{deleted:,}</b>\n"
             f"• Status: {esc(job_status)}\n\n"
             f"Total jobs so far: <b>{STATS.get('jobs', 0)}</b>",
         )
-
-
-def chat_type_word(chat_type: str) -> str:
-    return "channel" if chat_type == "channel" else "group"
 
 
 # --------------------------------------------------------------------------
@@ -591,17 +555,19 @@ def chat_type_word(chat_type: str) -> str:
 
 WELCOME = """👋 <b>Welcome to DelAll Bot</b>
 
-I delete every message in your channel or group, then remove myself automatically.
+I delete every message in your channel or group, then leave it automatically.
 
-<b>Option 1 — One tap (recommended)</b>
-Tap <b>➕ Add Channel</b> or <b>➕ Add Group</b> below. Telegram will show your list — pick one, and I'll be added as an admin automatically. Then just confirm.
+<b>Step 1 — Add me</b>
+Tap <b>➕ Add Channel</b> or <b>➕ Add Group</b> below. Telegram will show your list — pick one and I'll be promoted to admin automatically.
 
-<b>Option 2 — Manual</b>
-1. Open your channel or group
-2. <b>Administrators</b> → <b>Add Admin</b> → select me (@{username})
-3. Turn on <b>Delete Messages</b>
-4. Send <code>/delall</code> there
-5. Tap <b>Confirm Delete</b>
+<b>Step 2 — Send the command</b>
+Open that channel or group and send <code>/delall</code> there.
+
+<b>Step 3 — Confirm</b>
+Tap <b>Confirm Delete</b> and I'll take care of the rest.
+
+<b>Prefer to do it manually?</b>
+Open your channel or group → <b>Administrators</b> → <b>Add Admin</b> → select me (@{username}) → turn on <b>Delete Messages</b> → send <code>/delall</code>.
 
 Deletion cannot be undone, so I always ask for confirmation first.
 
@@ -648,7 +614,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------
-# Chat picked from Telegram's list
+# A chat was picked from Telegram's list
 # --------------------------------------------------------------------------
 
 
@@ -660,38 +626,18 @@ async def on_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     shared = message.chat_shared
     chat_id = shared.chat_id
     title = shared.title or str(chat_id)
-    kind = "channel" if shared.request_id == REQ_CHANNEL else "group"
+    word = "channel" if shared.request_id == REQ_CHANNEL else "group"
 
     ok, reason = await bot_can_delete(context, chat_id)
     if not ok:
-        await message.reply_text(
-            f"❌ {reason}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=picker_keyboard(),
-        )
+        await message.reply_text(f"❌ {reason}", parse_mode=ParseMode.HTML)
         return
-
-    if chat_id in RUNNING:
-        await message.reply_text("⏳ A deletion is already running there.")
-        return
-
-    context.user_data["target"] = {"id": chat_id, "title": title, "type": kind}
-
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🗑 Delete All Messages", callback_data="delall:go"),
-                InlineKeyboardButton("❌ Cancel", callback_data="delall:no"),
-            ]
-        ]
-    )
 
     await message.reply_text(
-        f"✅ I've been added to <b>{esc(title)}</b> as an administrator.\n\n"
-        f"Delete every message in this {kind}? This cannot be undone.\n"
-        f"I'll leave the {kind} as soon as I'm finished.",
+        f"✅ I'm now an administrator in <b>{esc(title)}</b>.\n\n"
+        f"<b>Next step:</b> open that {word} and send <code>/delall</code> there.\n\n"
+        f"I'll ask you to confirm, then delete every message and leave the {word}.",
         parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
     )
 
 
@@ -701,14 +647,11 @@ async def on_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 PRIVATE_DELALL_HELP = """ℹ️ <code>/delall</code> only works inside a channel or group.
 
-<b>Easiest way:</b> tap <b>➕ Add Channel</b> or <b>➕ Add Group</b> below — Telegram will show your list and I'll be added as an admin automatically.
+<b>Step 1</b> — Tap <b>➕ Add Channel</b> or <b>➕ Add Group</b> below and pick one from your list. I'll be promoted to admin automatically.
 
-<b>Or do it manually:</b>
-1. Open your channel or group
-2. <b>Administrators</b> → <b>Add Admin</b> → select me (@{username})
-3. Turn on <b>Delete Messages</b>
-4. Send <code>/delall</code> there
-5. Tap <b>Confirm Delete</b>"""
+<b>Step 2</b> — Open that channel or group and send <code>/delall</code> there.
+
+<b>Step 3</b> — Tap <b>Confirm Delete</b>."""
 
 
 async def cmd_delall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -718,9 +661,8 @@ async def cmd_delall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     if chat.type == ChatType.PRIVATE:
-        me = await context.bot.get_me()
         await message.reply_text(
-            PRIVATE_DELALL_HELP.format(username=me.username),
+            PRIVATE_DELALL_HELP,
             parse_mode=ParseMode.HTML,
             reply_markup=picker_keyboard(),
         )
@@ -731,8 +673,7 @@ async def cmd_delall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if not await is_chat_admin(context, chat.id, user_id):
         await message.reply_text(
-            "❌ Only administrators of this channel or group can use this command.",
-            parse_mode=ParseMode.HTML,
+            "❌ Only administrators of this channel or group can use this command."
         )
         return
 
@@ -776,57 +717,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     chat = query.message.chat
-    data = query.data
 
-    if data == "delall:no":
+    if query.data == "delall:no":
         await query.answer("Cancelled")
-        context.user_data.pop("target", None)
         try:
             await query.edit_message_text("❌ Cancelled. Nothing was deleted.")
         except TelegramError:
             pass
         return
 
-    # Started from the bot's private chat via the picker
-    if data == "delall:go":
-        target = context.user_data.get("target")
-        if not target:
-            await query.answer("That selection expired. Please pick the chat again.", show_alert=True)
-            return
-
-        ok, reason = await bot_can_delete(context, target["id"])
-        if not ok:
-            await query.answer()
-            try:
-                await query.edit_message_text(f"❌ {reason}", parse_mode=ParseMode.HTML)
-            except TelegramError:
-                pass
-            return
-
-        if target["id"] in RUNNING:
-            await query.answer("Already running.", show_alert=True)
-            return
-
-        await query.answer("Starting…")
-        context.user_data.pop("target", None)
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except TelegramError:
-            pass
-
-        await run_delete_job(
-            context,
-            target_chat_id=target["id"],
-            status_chat_id=chat.id,
-            status_message_id=query.message.message_id,
-            actor=query.from_user,
-            chat_title=target["title"],
-            chat_type=target["type"],
-        )
-        return
-
-    # Started with /delall inside the channel or group
-    if data != "delall:yes":
+    if query.data != "delall:yes":
         await query.answer()
         return
 
@@ -851,12 +751,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await query.answer("Starting…")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+
     actor = context.chat_data.pop("delall_user", None) or query.from_user
 
     await run_delete_job(
         context,
-        target_chat_id=chat.id,
-        status_chat_id=chat.id,
+        chat_id=chat.id,
         status_message_id=query.message.message_id,
         actor=actor,
         chat_title=chat.title or str(chat.id),
@@ -885,8 +789,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         f"👥 Total users: <b>{len(users)}</b>",
         f"🧹 Delete jobs: <b>{STATS.get('jobs', 0)}</b>",
-        f"🗑 Messages deleted: <b>{STATS.get('deleted', 0)}</b>",
-        f"💬 Unique chats: <b>{len(STATS.get('chats', []))}</b>",
+        f"🗑 Messages deleted: <b>{STATS.get('deleted', 0):,}</b>",
+        f"💬 Channels / groups: <b>{len(STATS.get('chats', []))}</b>",
     ]
 
     recent = STATS.get("recent", [])
@@ -895,7 +799,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for e in recent[:10]:
             lines.append(
                 f"• {esc(e['time'])} — {esc(e['title'])} ({esc(e['type'])}) — "
-                f"{e.get('deleted', 0)} deleted — {esc(e['status'])}"
+                f"{e.get('deleted', 0):,} deleted — {esc(e['status'])}"
             )
 
     latest = sorted(users.values(), key=lambda u: u.get("first_seen", ""), reverse=True)[:5]
@@ -939,13 +843,13 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     else:
         title = f"ℹ️ <b>Bot status changed to {esc(new)}</b>"
 
-    info = await chat_block(context, upd.chat.id, upd.chat.title)
+    info = await chat_block(context, upd.chat.id, upd.chat.title, upd.chat.type)
 
     await notify_owner(
         context,
         f"{title}\n\n"
-        f"<b>Channel / group:</b>\n{info}\n\n"
-        f"<b>By:</b>\n{user_block(upd.from_user)}\n\n"
+        f"{info}\n\n"
+        f"<b>By</b>\n{user_block(upd.from_user)}\n\n"
         f"• Time: {now_str()}\n"
         f"• Change: {esc(old)} → {esc(new)}",
     )
