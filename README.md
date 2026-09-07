@@ -5,12 +5,13 @@ itself automatically.
 
 ## For users
 
-**One-tap setup (recommended)**
+**Quick setup (recommended)**
 
-Send `/start` to the bot and tap **➕ Add Channel** or **➕ Add Group**.
-Telegram shows your own list of channels and groups — pick one, and the bot is
-added as an administrator automatically with the right permission. Then tap
-**Delete All Messages** and it's done.
+1. Send `/start` to the bot and tap **➕ Add Channel** or **➕ Add Group**
+2. Telegram shows your own list — pick one, and the bot is promoted to
+   administrator automatically with the right permission
+3. Open that channel or group and send `/delall` there
+4. Tap **Confirm Delete**
 
 **Manual setup**
 
@@ -20,7 +21,9 @@ added as an administrator automatically with the right permission. Then tap
 4. Send `/delall` there
 5. Tap **Confirm Delete**
 
-Either way, the bot leaves the channel or group as soon as it finishes.
+While it works you'll see a live progress bar. When it's done the bot posts a
+short closing message, leaves that closing message in place, and exits the
+channel or group.
 
 ## For the owner
 
@@ -28,7 +31,7 @@ Set `ADMIN_IDS` to your own Telegram user ID and you'll receive a DM when:
 
 - Someone starts the bot — name, username, user ID, language, time, start count
 - The bot is added to a channel or group — title, username, link, member count, description, invite link, and who added it
-- A delete job runs — full channel details, who started it, start/end time, deleted count, failed count, status
+- A delete job runs — channel/group name, ID, type, member count, link, who started it, start/end time, and status
 
 `/stats` gives you totals: users, jobs, messages deleted, unique chats, recent
 jobs, newest users.
@@ -89,5 +92,8 @@ delall - Delete all messages in a channel or group
 - The **Add Channel / Add Group** buttons appear above the keyboard rather than
   under the message. Telegram only supports its chat picker on keyboard buttons,
   not inline buttons.
+- Telegram's bulk delete reports success without saying how many messages
+  actually existed, so the bot does not claim an exact deleted count. The owner
+  report shows how many message IDs were scanned instead.
 - Stats reset when Railway redeploys unless you attach a volume. Notifications
   are unaffected.
